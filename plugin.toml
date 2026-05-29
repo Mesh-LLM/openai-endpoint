@@ -1,0 +1,4 @@
+name = "openai-endpoint"
+version = "0.1.0"
+description = "Route mesh-llm inference to an external OpenAI-compatible server."
+command = "openai-endpoint"

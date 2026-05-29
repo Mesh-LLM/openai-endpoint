@@ -1,0 +1,12 @@
+[package]
+name = "openai-endpoint"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "OpenAI-compatible endpoint plugin for mesh-llm"
+repository = "https://github.com/Mesh-LLM/openai-endpoint"
+
+[dependencies]
+anyhow = "1"
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", branch = "codex/plugin-cli-commands" }
+tokio = { version = "1", features = ["full"] }

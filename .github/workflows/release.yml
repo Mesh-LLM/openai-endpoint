@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            binary: openai-endpoint
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            package: tar
+          - name: macos-aarch64
+            os: macos-14
+            binary: openai-endpoint
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            package: tar
+          - name: windows-x86_64
+            os: windows-latest
+            binary: openai-endpoint.exe
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            package: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix archive
+        if: matrix.package == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.version || github.ref_name }}"
+          version="${version#v}"
+          stable_archive="openai-endpoint-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          versioned_archive="openai-endpoint-${version}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          mkdir -p dist/openai-endpoint
+          cp "target/release/${{ matrix.binary }}" dist/openai-endpoint/openai-endpoint
+          cp plugin.toml dist/openai-endpoint/plugin.toml
+          tar -czf "$stable_archive" -C dist openai-endpoint
+          cp "$stable_archive" "$versioned_archive"
+
+      - name: Package Windows archive
+        if: matrix.package == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version || github.ref_name }}".TrimStart("v")
+          $stableArchive = "openai-endpoint-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          $versionedArchive = "openai-endpoint-$version-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          New-Item -ItemType Directory -Force -Path dist/openai-endpoint | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" "dist/openai-endpoint/openai-endpoint.exe"
+          Copy-Item plugin.toml "dist/openai-endpoint/plugin.toml"
+          Compress-Archive -Path "dist/openai-endpoint" -DestinationPath $stableArchive
+          Copy-Item $stableArchive $versionedArchive
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openai-endpoint-${{ matrix.target }}
+          path: |
+            openai-endpoint-*.tar.gz
+            openai-endpoint-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: ${{ github.event.inputs.version || github.ref_name }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          overwrite_files: true
