@@ -10,3 +10,7 @@ repository = "https://github.com/Mesh-LLM/openai-endpoint"
 anyhow = "1"
 mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", branch = "codex/plugin-cli-commands" }
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"

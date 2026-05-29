@@ -37,3 +37,80 @@ jobs:
 
       - name: Build
         run: cargo build --locked
+
+  e2e-openai-endpoint:
+    name: E2E openai-endpoint
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LLAMA_CPP_TAG: b9394
+      MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q2_K.gguf
+      MESH_LLM_OPENAI_ENDPOINT_URL: http://127.0.0.1:8000/v1
+      OPENAI_ENDPOINT_E2E: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download llama.cpp server
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/llama"
+          gh release download "$LLAMA_CPP_TAG" \
+            --repo ggml-org/llama.cpp \
+            --pattern 'llama-*-bin-ubuntu-x64.tar.gz' \
+            --dir "$RUNNER_TEMP/llama"
+          tar -xzf "$RUNNER_TEMP"/llama/*.tar.gz -C "$RUNNER_TEMP/llama"
+          find "$RUNNER_TEMP/llama" -name llama-server -type f -print -quit
+
+      - name: Download SmolLM2 model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/models"
+          curl -L --fail --retry 3 --retry-delay 2 \
+            "$MODEL_URL" \
+            -o "$RUNNER_TEMP/models/smollm2-135m-instruct-q2_k.gguf"
+
+      - name: Start llama-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLAMA_DIR="$(find "$RUNNER_TEMP/llama" -maxdepth 1 -type d -name 'llama-*' | head -n 1)"
+          MODEL="$RUNNER_TEMP/models/smollm2-135m-instruct-q2_k.gguf"
+          LD_LIBRARY_PATH="$LLAMA_DIR" "$LLAMA_DIR/llama-server" \
+            --model "$MODEL" \
+            --host 127.0.0.1 \
+            --port 8000 \
+            --ctx-size 256 \
+            --threads 2 \
+            --n-gpu-layers 0 \
+            > "$RUNNER_TEMP/llama-server.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/llama-server.pid"
+
+      - name: Wait for llama-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -fsS "$MESH_LLM_OPENAI_ENDPOINT_URL/models" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/llama-server.log"
+          exit 1
+
+      - name: Run e2e test
+        run: cargo test --locked e2e_llama_server_answers_openai_requests -- --nocapture
+
+      - name: Show llama-server log on failure
+        if: failure()
+        shell: bash
+        run: cat "$RUNNER_TEMP/llama-server.log" || true
