@@ -10,7 +10,7 @@ Server.
 mesh-llm plugins install openai-endpoint
 ```
 
-Until the plugin catalog is updated, install directly from GitHub:
+You can also install directly from GitHub:
 
 ```bash
 mesh-llm plugins install Mesh-LLM/openai-endpoint
@@ -36,8 +36,8 @@ command = "openai-endpoint"
 url = "http://localhost:8000/v1"
 ```
 
-The plugin also reads `MESH_LLM_OPENAI_ENDPOINT_URL`. If neither config nor
-environment is set, it defaults to `http://localhost:8000/v1`.
+mesh-llm passes `url` to the plugin as `MESH_LLM_PLUGIN_URL`. If neither config
+nor environment is set, it defaults to `http://localhost:8000/v1`.
 
 ## Build
 

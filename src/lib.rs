@@ -8,7 +8,7 @@ const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 const PLUGIN_ID: &str = "openai-endpoint";
 
 fn base_url() -> String {
-    std::env::var("MESH_LLM_OPENAI_ENDPOINT_URL")
+    std::env::var("MESH_LLM_PLUGIN_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -29,7 +29,7 @@ fn build_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
                 "OpenAI-Compatible Endpoint Plugin",
                 "Routes inference to an external OpenAI-compatible server (vLLM, TGI, Ollama, etc.).",
                 Some(
-                    "Set MESH_LLM_OPENAI_ENDPOINT_URL to point at any server \
+                    "Set MESH_LLM_PLUGIN_URL to point at any server \
                      that speaks the OpenAI /v1/chat/completions API.",
                 ),
             ),
@@ -100,7 +100,7 @@ mod tests {
             return Ok(());
         }
 
-        let base_url = std::env::var("MESH_LLM_OPENAI_ENDPOINT_URL").unwrap_or_else(|_| base_url());
+        let base_url = std::env::var("MESH_LLM_PLUGIN_URL").unwrap_or_else(|_| base_url());
         let plugin = build_plugin(PLUGIN_ID.to_string());
         let manifest = plugin.manifest().context("plugin manifest")?;
         let endpoint = manifest
