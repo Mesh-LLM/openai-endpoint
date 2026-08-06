@@ -41,8 +41,8 @@ fn api_key_from_args() -> Result<Option<String>> {
     let path = args
         .get(index + 1)
         .context("--api-key-file requires a path argument")?;
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("reading api key file at {path}"))?;
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("reading api key file at {path}"))?;
     let key = contents.trim().to_string();
     if key.is_empty() {
         anyhow::bail!("api key file at {path} is empty");
@@ -72,6 +72,16 @@ fn is_hop_by_hop_response_header(name: &str) -> bool {
     matches!(name, "content-length" | "transfer-encoding" | "connection")
 }
 
+/// Path prefix this proxy always advertises as its own base (see
+/// `spawn_auth_proxy`'s `format!("http://{addr}{ADVERTISED_PATH_PREFIX}")`).
+/// Callers build requests by appending endpoint suffixes (`/models`,
+/// `/chat/completions`) to whatever base_url we registered, so every incoming
+/// request path starts with this prefix — it must be stripped before
+/// re-appending the suffix to the real `upstream_base_url` (which carries
+/// its own, possibly different, base path), or the two prefixes concatenate
+/// into a broken URL like `.../v1/v1/models`.
+const ADVERTISED_PATH_PREFIX: &str = "/v1";
+
 async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let path_and_query = parts
@@ -79,10 +89,13 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
+    let suffix = path_and_query
+        .strip_prefix(ADVERTISED_PATH_PREFIX)
+        .unwrap_or(path_and_query);
     let upstream_url = format!(
         "{}{}",
         state.upstream_base_url.trim_end_matches('/'),
-        path_and_query
+        suffix
     );
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -148,9 +161,7 @@ async fn spawn_auth_proxy(
         upstream_base_url,
         api_key,
     });
-    let app = Router::new()
-        .fallback(any(proxy_handler))
-        .with_state(state);
+    let app = Router::new().fallback(any(proxy_handler)).with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("binding local auth-proxy listener")?;
@@ -208,7 +219,7 @@ async fn run_plugin(name: String) -> Result<()> {
     let upstream_base_url = upstream_base_url();
     let api_key = api_key_from_args()?;
     let proxy_addr = spawn_auth_proxy(upstream_base_url.clone(), api_key).await?;
-    let advertised_base_url = format!("http://{proxy_addr}/v1");
+    let advertised_base_url = format!("http://{proxy_addr}{ADVERTISED_PATH_PREFIX}");
     PluginRuntime::run(build_plugin(name, advertised_base_url, upstream_base_url)).await
 }
 
@@ -294,8 +305,14 @@ mod tests {
     #[tokio::test]
     async fn proxy_injects_bearer_key_and_strips_caller_authorization() -> Result<()> {
         let upstream = axum_test_upstream().await?;
+        // Real servers (e.g. LM Studio) are commonly configured with a base
+        // URL that itself ends in "/v1" — exactly like this plugin's own
+        // advertised base. Naively concatenating the two produces
+        // "/v1/v1/models". Use a real "/v1" upstream base and an EXACT route
+        // (no fallback) so a reintroduced double-prefix bug 404s instead of
+        // silently passing.
         let proxy_addr = spawn_auth_proxy(
-            format!("http://{}", upstream.addr),
+            format!("http://{}/v1", upstream.addr),
             Some("secret-lmstudio-key".to_string()),
         )
         .await?;
@@ -306,7 +323,11 @@ mod tests {
             .header("authorization", "Bearer caller-supplied-should-be-dropped")
             .send()
             .await?;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "must reach the upstream's exact /v1/models route, not /v1/v1/models"
+        );
         let seen_auth = response.text().await?;
         assert_eq!(seen_auth, "Bearer secret-lmstudio-key");
         Ok(())
@@ -316,8 +337,7 @@ mod tests {
     async fn proxy_returns_bad_gateway_when_upstream_unreachable() -> Result<()> {
         // Port 1 is reserved/unroutable, so this fails immediately without a
         // real dependency on "nothing listens there" being stable elsewhere.
-        let proxy_addr =
-            spawn_auth_proxy("http://127.0.0.1:1".to_string(), None).await?;
+        let proxy_addr = spawn_auth_proxy("http://127.0.0.1:1".to_string(), None).await?;
         let client = reqwest::Client::new();
         let response = client
             .get(format!("http://{proxy_addr}/v1/models"))
@@ -333,6 +353,9 @@ mod tests {
 
     /// Minimal upstream double that echoes back the `Authorization` header
     /// it received, so tests can assert on exactly what the proxy sent.
+    /// Routes ONLY `/v1/models` — deliberately no wildcard fallback, so a
+    /// wrong forwarded path (e.g. a reintroduced "/v1/v1/models" double
+    /// prefix) 404s instead of silently matching anyway.
     async fn axum_test_upstream() -> Result<TestUpstream> {
         async fn echo_auth(headers: HeaderMap) -> String {
             headers
@@ -341,7 +364,7 @@ mod tests {
                 .unwrap_or_default()
                 .to_string()
         }
-        let app = Router::new().fallback(any(echo_auth));
+        let app = Router::new().route("/v1/models", axum::routing::get(echo_auth));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         tokio::spawn(async move {
