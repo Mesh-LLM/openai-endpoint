@@ -140,7 +140,33 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -
         response_headers.insert(name.clone(), value.clone());
     }
 
-    let mut response = Response::new(Body::from_stream(upstream_response.bytes_stream()));
+    // Buffer the full body rather than streaming it: `content-length` is
+    // stripped above (it's stale once headers are rewritten in general),
+    // and a streamed body with no content-length forces
+    // `Transfer-Encoding: chunked`. mesh-llm-host-runtime's non-streaming
+    // JSON response path reads exactly `content_length` bytes and expects
+    // that to be the whole body — fed chunked framing instead, it parses the
+    // chunk-size/CRLF markers and the terminating `0\r\n\r\n` as part of the
+    // JSON payload, which fails with a "trailing characters" parse error. A
+    // known-size body lets the server set `content-length` correctly again.
+    //
+    // This does mean a true `stream: true` SSE completion is buffered in
+    // full before any of it reaches the caller rather than forwarded
+    // token-by-token — streaming pass-through is a known follow-up worth
+    // its own change once the host runtime's streaming path is verified
+    // against a buffered-vs-chunked plugin response.
+    let body_bytes = match upstream_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("reading upstream response body: {error}"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = Response::new(Body::from(body_bytes));
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response
