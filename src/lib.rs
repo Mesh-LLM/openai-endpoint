@@ -17,6 +17,13 @@ use tokio::net::TcpListener;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_BASE_URL: &str = "http://localhost:8000/v1";
 const PLUGIN_ID: &str = "openai-endpoint";
+/// Caller request bodies are buffered in full before forwarding (needed to
+/// inject the bearer header and recompute framing). Cap it rather than
+/// buffering an unbounded body — the listener is loopback-only, so exposure
+/// is limited, but an unbounded cap is still a needless memory-exhaustion
+/// footgun for a fixed-cost safeguard. Comfortably above any real chat
+/// completion payload (large prompts, embedded images/audio as base64).
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 fn upstream_base_url() -> String {
     std::env::var("MESH_LLM_PLUGIN_URL")
@@ -59,17 +66,39 @@ struct ProxyState {
 /// Hop-by-hop / credential headers that must never ride through unchanged:
 /// `host` is rebuilt from `upstream_base_url`, `authorization` from any
 /// original caller is discarded so only this proxy's own key ever reaches
-/// the upstream, and body-framing headers are recomputed by reqwest/axum
-/// for the (possibly re-encoded) forwarded body.
+/// the upstream, body-framing headers are recomputed by reqwest/axum for
+/// the (possibly re-encoded) forwarded body, and the rest are the
+/// RFC 7230 §6.1 hop-by-hop set (connection-scoped, never meaningful two
+/// hops away).
 fn is_hop_by_hop_request_header(name: &str) -> bool {
     matches!(
         name,
-        "host" | "authorization" | "content-length" | "transfer-encoding" | "connection"
+        "host"
+            | "authorization"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
     )
 }
 
 fn is_hop_by_hop_response_header(name: &str) -> bool {
-    matches!(name, "content-length" | "transfer-encoding" | "connection")
+    matches!(
+        name,
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-authenticate"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
 }
 
 /// Path prefix this proxy always advertises as its own base (see
@@ -98,11 +127,13 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -
         suffix
     );
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
+            // The failure is in reading the *caller's* body, before any
+            // upstream call is made — a client error, not a gateway one.
             return (
-                StatusCode::BAD_GATEWAY,
+                StatusCode::BAD_REQUEST,
                 format!("reading request body: {error}"),
             )
                 .into_response();
@@ -123,11 +154,12 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -
     let upstream_response = match upstream_request.body(body_bytes).send().await {
         Ok(response) => response,
         Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("upstream request failed: {error}"),
-            )
-                .into_response();
+            // Never put the raw reqwest error in the response: its Display
+            // output commonly includes the real upstream host/scheme, which
+            // is exactly what this proxy exists to keep out of anything the
+            // mesh (or a caller two hops away) can see. Log locally instead.
+            eprintln!("openai-endpoint proxy: upstream request failed: {error:#}");
+            return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response();
         }
     };
 
@@ -137,7 +169,9 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -
         if is_hop_by_hop_response_header(name.as_str()) {
             continue;
         }
-        response_headers.insert(name.clone(), value.clone());
+        // append, not insert: a repeated header (e.g. set-cookie) collapses
+        // to its last value under insert, silently dropping the rest.
+        response_headers.append(name.clone(), value.clone());
     }
 
     // Buffer the full body rather than streaming it: `content-length` is
@@ -158,11 +192,10 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, request: Request) -
     let body_bytes = match upstream_response.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("reading upstream response body: {error}"),
-            )
-                .into_response();
+            // Same rationale as the request-send error above: log locally,
+            // keep the real upstream out of the response.
+            eprintln!("openai-endpoint proxy: reading upstream response body failed: {error:#}");
+            return (StatusCode::BAD_GATEWAY, "reading upstream response body").into_response();
         }
     };
 
@@ -183,7 +216,17 @@ async fn spawn_auth_proxy(
     api_key: Option<String>,
 ) -> Result<SocketAddr> {
     let state = Arc::new(ProxyState {
-        client: reqwest::Client::new(),
+        // Unbounded by default: a stalled upstream (wedged process, dropped
+        // connection with no RST) would otherwise hold the proxying task
+        // open indefinitely. `read_timeout` is a sliding per-read window
+        // (resets on every successful chunk), not a total-duration cap, so
+        // it won't cut off a slow-but-progressing streaming completion —
+        // only one that's gone genuinely silent.
+        client: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .build()
+            .context("building auth-proxy upstream client")?,
         upstream_base_url,
         api_key,
     });
@@ -241,11 +284,21 @@ fn build_plugin(
     }
 }
 
+/// The base URL this plugin advertises to mesh-llm for a proxy bound at
+/// `proxy_addr` — always loopback, since `proxy_addr` always is (see
+/// `spawn_auth_proxy`, which only ever binds `127.0.0.1`). Extracted so
+/// tests can exercise the actual derivation `run_plugin` uses, rather than
+/// only the (unrelated) claim that `build_plugin` echoes back whatever
+/// string it's given.
+fn advertised_base_url_for_proxy(proxy_addr: SocketAddr) -> String {
+    format!("http://{proxy_addr}{ADVERTISED_PATH_PREFIX}")
+}
+
 async fn run_plugin(name: String) -> Result<()> {
     let upstream_base_url = upstream_base_url();
     let api_key = api_key_from_args()?;
     let proxy_addr = spawn_auth_proxy(upstream_base_url.clone(), api_key).await?;
-    let advertised_base_url = format!("http://{proxy_addr}{ADVERTISED_PATH_PREFIX}");
+    let advertised_base_url = advertised_base_url_for_proxy(proxy_addr);
     PluginRuntime::run(build_plugin(name, advertised_base_url, upstream_base_url)).await
 }
 
@@ -356,6 +409,45 @@ mod tests {
         );
         let seen_auth = response.text().await?;
         assert_eq!(seen_auth, "Bearer secret-lmstudio-key");
+        Ok(())
+    }
+
+    /// Unlike `advertised_endpoint_is_always_loopback_never_real_upstream`
+    /// (which only proves `build_plugin` echoes back whatever
+    /// `advertised_base_url` it's handed), this exercises the actual
+    /// derivation `run_plugin` uses — a real bound proxy address run
+    /// through `advertised_base_url_for_proxy` — so a change to that
+    /// derivation that stopped producing a loopback URL would be caught
+    /// here.
+    #[tokio::test]
+    async fn run_plugin_derives_a_loopback_advertised_url_from_the_real_proxy_addr() -> Result<()>
+    {
+        let proxy_addr = spawn_auth_proxy("http://127.0.0.1:1".to_string(), None).await?;
+        let advertised = advertised_base_url_for_proxy(proxy_addr);
+        assert_eq!(advertised, format!("http://{proxy_addr}/v1"));
+        assert!(
+            advertised.starts_with("http://127.0.0.1:"),
+            "advertised URL {advertised} must be loopback"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxy_omits_authorization_when_no_api_key_configured() -> Result<()> {
+        let upstream = axum_test_upstream().await?;
+        let proxy_addr = spawn_auth_proxy(format!("http://{}/v1", upstream.addr), None).await?;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{proxy_addr}/v1/models"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen_auth = response.text().await?;
+        assert_eq!(
+            seen_auth, "",
+            "no api_key configured means no Authorization header should reach upstream"
+        );
         Ok(())
     }
 
