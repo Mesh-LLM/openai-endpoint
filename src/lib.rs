@@ -26,7 +26,7 @@ fn build_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
             plugin_server_info(
                 "mesh-openai-endpoint",
                 VERSION,
-                "OpenAI-Compatible Endpoint Plugin",
+                "External Model Endpoint",
                 "Routes inference to an external OpenAI-compatible server (vLLM, TGI, Ollama, etc.).",
                 Some(
                     "Set MESH_LLM_PLUGIN_URL to point at any server \
@@ -77,6 +77,17 @@ mod tests {
     use mesh_llm_plugin::Plugin;
     use serde_json::{Value, json};
     use std::time::Duration;
+
+    #[test]
+    fn targets_mesh_076_protocol_and_preserves_install_identity() {
+        // The published 0.1.2 adapter used protocol 2 and could install but not
+        // initialize on Mesh 0.76. Updating the SDK must preserve this contract.
+        assert_eq!(mesh_llm_plugin::PROTOCOL_VERSION, 3);
+        let plugin = build_plugin(PLUGIN_ID.to_string());
+        assert_eq!(plugin.plugin_id(), "openai-endpoint");
+        let info = serde_json::to_value(plugin.server_info()).expect("server info");
+        assert_eq!(info["serverInfo"]["title"], "External Model Endpoint");
+    }
 
     #[test]
     fn manifest_declares_external_openai_endpoint() {
