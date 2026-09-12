@@ -10,12 +10,21 @@ server. Once registered, Mesh forwards requests directly to that server.
 
 ## Compatibility
 
-This source targets **Mesh 0.76.0 / plugin protocol 3**, using the SDK pinned to
-that release commit. Published adapter **0.1.2 uses protocol 2** and cannot start
-on Mesh 0.76.0: it fails with `uses protocol 2, host uses 3`. Installing a package
-successfully does not establish host/plugin compatibility. Until a protocol-3
-adapter release is published, use the source-build option below; the ordinary
-install command still selects the incompatible published release.
+Adapter **0.2.0 targets Mesh 0.76.0 / plugin protocol 3**, using the SDK pinned
+to that Mesh release commit. Adapter **0.1.2 uses protocol 2** and cannot start
+on Mesh 0.76.0: it fails with `uses protocol 2, host uses 3`.
+
+The unversioned install command selects the latest published GitHub release,
+not a host-compatible version automatically. To select this release explicitly:
+
+```bash
+mesh-llm plugins install Mesh-LLM/openai-endpoint@0.2.0
+```
+
+Existing installs can use `mesh-llm plugins update openai-endpoint` once 0.2.0
+is published. If you used a source `command` override, remove it to use the
+installed package, then restart your Mesh instance. A source build remains an
+option before the release assets are available.
 
 Protocol-2 hosts need the older adapter, pinned explicitly:
 
@@ -23,8 +32,8 @@ Protocol-2 hosts need the older adapter, pinned explicitly:
 mesh-llm plugins install Mesh-LLM/openai-endpoint@0.1.2
 ```
 
-Do not bypass the host's protocol check. A future protocol-3 latest release will
-not be compatible with protocol-2 hosts.
+Do not bypass the host's protocol check. Protocol-3 releases are
+not compatible with protocol-2 hosts.
 
 ## Quick start: share your existing server
 
@@ -232,7 +241,7 @@ certification for every named provider, platform, streaming or authentication mo
 For Mesh 0.76.0, build this protocol-3 source using Rust and Git:
 
 ```bash
-git clone --branch jimmy/endpoint-protocol3-rescue https://github.com/Mesh-LLM/openai-endpoint.git
+git clone --branch v0.2.0 https://github.com/Mesh-LLM/openai-endpoint.git
 cd openai-endpoint
 cargo build --release --locked
 ```
